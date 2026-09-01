@@ -25,10 +25,10 @@ fn upload_to_release(tag: &str, file_name: &str) {
     }
 }
 
-// JSON-RPC Batching (50 Blocks per request for maximum throughput)
+// JSON-RPC Batching with Multi-RPC Retry
 async fn fetch_rpc_batch_blocks(
     client: &reqwest::Client,
-    rpc_url: &str,
+    rpc_urls: &[String],
     blocks: Vec<u64>,
 ) -> Vec<String> {
     let mut addrs = Vec::new();
@@ -44,26 +44,30 @@ async fn fetch_rpc_batch_blocks(
         })
         .collect();
 
-    for _ in 0..3 {
-        let resp = client.post(rpc_url).json(&batch_payload).send().await;
-        if let Ok(res) = resp {
-            if let Ok(json_arr) = res.json::<Vec<Value>>().await {
-                for item in json_arr {
-                    if let Some(txs) = item.get("result").and_then(|r| r.get("transactions")).and_then(|t| t.as_array()) {
-                        for tx in txs {
-                            if let Some(from) = tx.get("from").and_then(|v| v.as_str()) {
-                                addrs.push(from.to_lowercase());
-                            }
-                            if let Some(to) = tx.get("to").and_then(|v| v.as_str()) {
-                                addrs.push(to.to_lowercase());
+    for rpc in rpc_urls {
+        for _ in 0..2 {
+            let resp = client.post(rpc).json(&batch_payload).send().await;
+            if let Ok(res) = resp {
+                if let Ok(json_arr) = res.json::<Vec<Value>>().await {
+                    for item in json_arr {
+                        if let Some(txs) = item.get("result").and_then(|r| r.get("transactions")).and_then(|t| t.as_array()) {
+                            for tx in txs {
+                                if let Some(from) = tx.get("from").and_then(|v| v.as_str()) {
+                                    addrs.push(from.to_lowercase());
+                                }
+                                if let Some(to) = tx.get("to").and_then(|v| v.as_str()) {
+                                    addrs.push(to.to_lowercase());
+                                }
                             }
                         }
                     }
+                    if !addrs.is_empty() || blocks.is_empty() {
+                        return addrs;
+                    }
                 }
-                return addrs;
             }
+            sleep(Duration::from_millis(150)).await;
         }
-        sleep(Duration::from_millis(200)).await;
     }
     addrs
 }
@@ -73,38 +77,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let release_tag = env::var("RELEASE_TAG").ok();
     let chain = env::var("TARGET_CHAIN").unwrap_or_else(|_| "bnb".to_string());
 
-    let rpc_url = match chain.as_str() {
-        "bnb" => "https://binance.llamarpc.com",
-        "ethereum" => "https://cloudflare-eth.com",
-        "polygon" => "https://polygon-rpc.com",
-        "arbitrum" => "https://arb1.arbitrum.io/rpc",
-        "base" => "https://mainnet.base.org",
-        "optimism" => "https://mainnet.optimism.io",
-        "avalanche_c" => "https://api.avax.network/ext/bc/C/rpc",
-        _ => "https://binance.llamarpc.com",
+    // Verified High-Availability Official & Public RPCs
+    let rpc_list: Vec<String> = match chain.as_str() {
+        "bnb" => vec![
+            "https://bsc-dataseed.binance.org/".into(),
+            "https://bsc-dataseed1.defibit.io/".into(),
+            "https://bsc-dataseed1.ninicoin.io/".into(),
+            "https://rpc.ankr.com/bsc".into(),
+            "https://1rpc.io/bnb".into(),
+        ],
+        "ethereum" => vec![
+            "https://eth.llamarpc.com".into(),
+            "https://cloudflare-eth.com".into(),
+            "https://rpc.ankr.com/eth".into(),
+            "https://1rpc.io/eth".into(),
+        ],
+        "polygon" => vec![
+            "https://polygon-rpc.com".into(),
+            "https://rpc.ankr.com/polygon".into(),
+            "https://1rpc.io/matic".into(),
+        ],
+        "arbitrum" => vec![
+            "https://arb1.arbitrum.io/rpc".into(),
+            "https://rpc.ankr.com/arbitrum".into(),
+            "https://1rpc.io/arb".into(),
+        ],
+        "base" => vec![
+            "https://mainnet.base.org".into(),
+            "https://base.llamarpc.com".into(),
+            "https://1rpc.io/base".into(),
+        ],
+        "optimism" => vec![
+            "https://mainnet.optimism.io".into(),
+            "https://optimism.llamarpc.com".into(),
+            "https://1rpc.io/op".into(),
+        ],
+        "avalanche_c" => vec![
+            "https://api.avax.network/ext/bc/C/rpc".into(),
+            "https://rpc.ankr.com/avalanche".into(),
+            "https://1rpc.io/avax/c".into(),
+        ],
+        _ => vec!["https://bsc-dataseed.binance.org/".into()],
     };
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(30))
         .build()?;
     let client = Arc::new(client);
-    let rpc_url = Arc::new(rpc_url.to_string());
+    let rpc_list = Arc::new(rpc_list);
 
-    // Fetch chain height
-    let block_res: Value = client
-        .post(rpc_url.as_str())
-        .json(&json!({"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}))
-        .send()
-        .await?
-        .json()
-        .await?;
+    // Latest block height check with fallback
+    let mut max_block = 42_000_000;
+    for rpc in rpc_list.iter() {
+        if let Ok(resp) = client
+            .post(rpc)
+            .json(&json!({"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}))
+            .send()
+            .await
+        {
+            if let Ok(block_res) = resp.json::<Value>().await {
+                if let Some(hex_str) = block_res["result"].as_str() {
+                    if let Ok(b) = u64::from_str_radix(hex_str.trim_start_matches("0x"), 16) {
+                        max_block = b;
+                        println!("Connected successfully to RPC: {} | Height: {}", rpc, max_block);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
-    let latest_hex = block_res["result"].as_str().unwrap_or("0x1");
-    let max_block = u64::from_str_radix(latest_hex.trim_start_matches("0x"), 16).unwrap_or(42_000_000);
+    println!("Target: {} | Max Chain Height: {}", chain.to_uppercase(), max_block);
 
-    println!("Target: {} | Total Chain Blocks: {}", chain.to_uppercase(), max_block);
-
-    // EXACT 1,000,000 (1 Million) BLOCKS PER PART
+    // 1,000,000 (1 Million) Blocks per Part
     let million_step: u64 = 1_000_000;
     let mut current_block: u64 = 0;
     let mut part_num: u32 = 1;
@@ -112,41 +157,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while current_block < max_block {
         let end_block = (current_block + million_step).min(max_block);
         println!("\n=======================================================");
-        println!("[Part #{:03}] Extracting Blocks {} to {} (1 Million Blocks Chunk)", part_num, current_block, end_block);
+        println!("[Part #{:03}] Extracting Blocks {} to {} (1 Million Chunk)", part_num, current_block, end_block);
         println!("=======================================================");
 
-        // Split 1M blocks into 50-block micro-batches for parallel RPC calls
         let mut micro_chunks = Vec::new();
         let mut b = current_block;
         while b < end_block {
-            let chunk_end = (b + 50).min(end_block);
+            let chunk_end = (b + 25).min(end_block); // Safe 25-block micro batches
             micro_chunks.push((b..chunk_end).collect::<Vec<u64>>());
             b = chunk_end;
         }
 
         let mut unique_set: HashSet<String> = HashSet::new();
 
-        // 15 Concurrent RPC Workers
         let mut stream = stream::iter(micro_chunks)
             .map(|chunk| {
                 let client = Arc::clone(&client);
-                let rpc = Arc::clone(&rpc_url);
+                let rpcs = Arc::clone(&rpc_list);
                 tokio::spawn(async move {
-                    fetch_rpc_batch_blocks(&client, &rpc, chunk).await
+                    fetch_rpc_batch_blocks(&client, &rpcs, chunk).await
                 })
             })
-            .buffer_unordered(15);
+            .buffer_unordered(12);
 
-        let mut processed_micro_batches = 0;
+        let mut processed_batches = 0;
         while let Some(res) = stream.next().await {
             if let Ok(addresses) = res {
                 for addr in addresses {
                     unique_set.insert(addr);
                 }
             }
-            processed_micro_batches += 1;
-            if processed_micro_batches % 2000 == 0 {
-                println!("Processed {}k / 1,000k blocks (Addresses in memory: {})", processed_micro_batches * 50 / 1000, unique_set.len());
+            processed_batches += 1;
+            if processed_batches % 2000 == 0 {
+                println!(
+                    "Progress: {}k / 1,000k blocks scanned (Addresses in chunk: {})",
+                    processed_batches * 25 / 1000,
+                    unique_set.len()
+                );
             }
         }
 
@@ -162,9 +209,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             wtr.flush()?;
 
-            println!("1 Million Block Chunk Complete! Total Unique: {} -> {}", unique_set.len(), file_name);
+            println!("Chunk #{} completed! Total: {} -> {}", part_num, unique_set.len(), file_name);
 
-            // Instant Upload to Release
             if let Some(tag) = release_tag.as_deref() {
                 upload_to_release(tag, &file_name);
             }
@@ -174,6 +220,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         part_num += 1;
     }
 
-    println!("\nAll 1 Million Block Parts extracted and uploaded!");
+    println!("\nAll parts extracted successfully!");
     Ok(())
 }
