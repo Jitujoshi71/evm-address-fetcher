@@ -18,14 +18,14 @@ fn upload_to_release(tag: &str, file_name: &str) {
 
     match status {
         Ok(s) if s.success() => {
-            println!("Uploaded: {}", file_name);
+            println!("Successfully uploaded: {}", file_name);
             let _ = fs::remove_file(file_name);
         }
         _ => eprintln!("Failed to upload {}", file_name),
     }
 }
 
-// JSON-RPC Batching: 1 Call me 20 Blocks ka data ek sath mangna
+// JSON-RPC Batching (50 Blocks per request for maximum throughput)
 async fn fetch_rpc_batch_blocks(
     client: &reqwest::Client,
     rpc_url: &str,
@@ -63,7 +63,7 @@ async fn fetch_rpc_batch_blocks(
                 return addrs;
             }
         }
-        sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(200)).await;
     }
     addrs
 }
@@ -73,7 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let release_tag = env::var("RELEASE_TAG").ok();
     let chain = env::var("TARGET_CHAIN").unwrap_or_else(|_| "bnb".to_string());
 
-    // High performance Public EVM RPC URLs
     let rpc_url = match chain.as_str() {
         "bnb" => "https://binance.llamarpc.com",
         "ethereum" => "https://cloudflare-eth.com",
@@ -86,12 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(45))
+        .timeout(Duration::from_secs(60))
         .build()?;
     let client = Arc::new(client);
     let rpc_url = Arc::new(rpc_url.to_string());
 
-    // Current block height check karein
+    // Fetch chain height
     let block_res: Value = client
         .post(rpc_url.as_str())
         .json(&json!({"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}))
@@ -101,51 +100,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let latest_hex = block_res["result"].as_str().unwrap_or("0x1");
-    let max_block = u64::from_str_radix(latest_hex.trim_start_matches("0x"), 16).unwrap_or(40_000_000);
+    let max_block = u64::from_str_radix(latest_hex.trim_start_matches("0x"), 16).unwrap_or(42_000_000);
 
-    println!("Target Chain: {} | RPC URL: {} | Max Block: {}", chain, rpc_url, max_block);
+    println!("Target: {} | Total Chain Blocks: {}", chain.to_uppercase(), max_block);
 
-    let part_size: u64 = 1_000_000; // 1000000 blocks per CSV Part
+    // EXACT 1,000,000 (1 Million) BLOCKS PER PART
+    let million_step: u64 = 1_000_000;
     let mut current_block: u64 = 0;
     let mut part_num: u32 = 1;
 
     while current_block < max_block {
-        let end_block = (current_block + part_size).min(max_block);
-        println!("\n[Batch #{:04}] Processing blocks {} to {}...", part_num, current_block, end_block);
+        let end_block = (current_block + million_step).min(max_block);
+        println!("\n=======================================================");
+        println!("[Part #{:03}] Extracting Blocks {} to {} (1 Million Blocks Chunk)", part_num, current_block, end_block);
+        println!("=======================================================");
 
-        // Group blocks into chunks of 20 for RPC JSON batching
-        let mut chunks = Vec::new();
+        // Split 1M blocks into 50-block micro-batches for parallel RPC calls
+        let mut micro_chunks = Vec::new();
         let mut b = current_block;
         while b < end_block {
-            let chunk_end = (b + 20).min(end_block);
-            chunks.push((b..chunk_end).collect::<Vec<u64>>());
+            let chunk_end = (b + 50).min(end_block);
+            micro_chunks.push((b..chunk_end).collect::<Vec<u64>>());
             b = chunk_end;
         }
 
-        // Run 10 parallel async RPC workers concurrently
-        let results = stream::iter(chunks)
-            .map(|block_chunk| {
+        let mut unique_set: HashSet<String> = HashSet::new();
+
+        // 15 Concurrent RPC Workers
+        let mut stream = stream::iter(micro_chunks)
+            .map(|chunk| {
                 let client = Arc::clone(&client);
                 let rpc = Arc::clone(&rpc_url);
                 tokio::spawn(async move {
-                    fetch_rpc_batch_blocks(&client, &rpc, block_chunk).await
+                    fetch_rpc_batch_blocks(&client, &rpc, chunk).await
                 })
             })
-            .buffer_unordered(10)
-            .collect::<Vec<_>>()
-            .await;
+            .buffer_unordered(15);
 
-        let mut unique_set: HashSet<String> = HashSet::new();
-        for res in results {
+        let mut processed_micro_batches = 0;
+        while let Some(res) = stream.next().await {
             if let Ok(addresses) = res {
                 for addr in addresses {
                     unique_set.insert(addr);
                 }
             }
+            processed_micro_batches += 1;
+            if processed_micro_batches % 2000 == 0 {
+                println!("Processed {}k / 1,000k blocks (Addresses in memory: {})", processed_micro_batches * 50 / 1000, unique_set.len());
+            }
         }
 
         if !unique_set.is_empty() {
-            let file_name = format!("{}_addresses_part_{:04}.csv.gz", chain, part_num);
+            let file_name = format!("{}_addresses_1M_part_{:03}.csv.gz", chain, part_num);
             let file = File::create(&file_name)?;
             let enc = GzEncoder::new(file, Compression::default());
             let mut wtr = csv::Writer::from_writer(enc);
@@ -156,8 +162,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             wtr.flush()?;
 
-            println!("Saved {} unique addresses -> {}", unique_set.len(), file_name);
+            println!("1 Million Block Chunk Complete! Total Unique: {} -> {}", unique_set.len(), file_name);
 
+            // Instant Upload to Release
             if let Some(tag) = release_tag.as_deref() {
                 upload_to_release(tag, &file_name);
             }
@@ -167,6 +174,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         part_num += 1;
     }
 
-    println!("\nPipeline completed successfully!");
+    println!("\nAll 1 Million Block Parts extracted and uploaded!");
     Ok(())
 }
