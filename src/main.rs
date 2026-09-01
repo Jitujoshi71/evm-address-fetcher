@@ -1,142 +1,172 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use serde_json::Value;
+use futures::stream::{self, StreamExt};
+use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::{copy, Cursor};
 use std::process::Command;
-use std::thread::sleep;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::sleep;
 
-fn upload_to_release(tag: &str, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Uploading {} to release tag '{}'...", file_name, tag);
+fn upload_to_release(tag: &str, file_name: &str) {
+    println!("Uploading {} to GitHub Release '{}'...", file_name, tag);
     let status = Command::new("gh")
         .args(["release", "upload", tag, file_name, "--clobber"])
-        .status()?;
+        .status();
 
-    if status.success() {
-        println!("Uploaded successfully: {}", file_name);
-        let _ = fs::remove_file(file_name);
+    match status {
+        Ok(s) if s.success() => {
+            println!("Uploaded: {}", file_name);
+            let _ = fs::remove_file(file_name);
+        }
+        _ => eprintln!("Failed to upload {}", file_name),
     }
-    Ok(())
 }
 
-fn fetch_batch(
-    client: &reqwest::blocking::Client,
-    api_key: &str,
-    release_tag: Option<&str>,
-    chain: &str,
-    start_block: u64,
-    end_block: u64,
-    batch_num: u32,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    println!("\n[{}] Batch #{}: Blocks {} to {}", chain.to_uppercase(), batch_num, start_block, end_block);
+// JSON-RPC Batching: 1 Call me 20 Blocks ka data ek sath mangna
+async fn fetch_rpc_batch_blocks(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    blocks: Vec<u64>,
+) -> Vec<String> {
+    let mut addrs = Vec::new();
+    let batch_payload: Vec<Value> = blocks
+        .iter()
+        .map(|&b| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "eth_getBlockByNumber",
+                "params": [format!("0x{:x}", b), true],
+                "id": b
+            })
+        })
+        .collect();
 
-    let sql_query = format!(
-        "SELECT DISTINCT address FROM (SELECT \"from\" AS address FROM {}.transactions WHERE block_number >= {} AND block_number < {} UNION ALL SELECT \"to\" AS address FROM {}.transactions WHERE block_number >= {} AND block_number < {}) AS t WHERE address IS NOT NULL",
-        chain, start_block, end_block, chain, start_block, end_block
-    );
-
-    let payload = serde_json::json!({ "sql": sql_query });
-
-    let res = client
-        .post("https://api.dune.com/api/v1/sql/execute")
-        .header("X-DUNE-API-KEY", api_key)
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()?;
-
-    let resp_val: Value = res.json()?;
-    let execution_id = match resp_val.get("execution_id").and_then(|v| v.as_str()) {
-        Some(id) => id.to_string(),
-        None => {
-            eprintln!("Execution submit failed: {:?}", resp_val);
-            return Ok(false);
-        }
-    };
-
-    let status_url = format!("https://api.dune.com/api/v1/execution/{}/status", execution_id);
-    let mut is_completed = false;
-
-    for _ in 0..60 {
-        sleep(Duration::from_secs(6));
-        let res = match client.get(&status_url).header("X-DUNE-API-KEY", api_key).send() {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        if let Ok(json_res) = res.json::<Value>() {
-            if let Some(state) = json_res.get("state").and_then(|s| s.as_str()) {
-                if state == "QUERY_STATE_COMPLETED" {
-                    is_completed = true;
-                    break;
-                } else if state == "QUERY_STATE_FAILED" || state == "QUERY_STATE_CANCELLED" {
-                    return Ok(false);
+    for _ in 0..3 {
+        let resp = client.post(rpc_url).json(&batch_payload).send().await;
+        if let Ok(res) = resp {
+            if let Ok(json_arr) = res.json::<Vec<Value>>().await {
+                for item in json_arr {
+                    if let Some(txs) = item.get("result").and_then(|r| r.get("transactions")).and_then(|t| t.as_array()) {
+                        for tx in txs {
+                            if let Some(from) = tx.get("from").and_then(|v| v.as_str()) {
+                                addrs.push(from.to_lowercase());
+                            }
+                            if let Some(to) = tx.get("to").and_then(|v| v.as_str()) {
+                                addrs.push(to.to_lowercase());
+                            }
+                        }
+                    }
                 }
+                return addrs;
             }
         }
-        print!(".");
+        sleep(Duration::from_millis(300)).await;
     }
-
-    if !is_completed {
-        eprintln!("\nBatch #{} timed out.", batch_num);
-        return Ok(false);
-    }
-
-    let csv_url = format!("https://api.dune.com/api/v1/execution/{}/results/csv", execution_id);
-    let mut csv_resp = client.get(&csv_url).header("X-DUNE-API-KEY", api_key).send()?;
-
-    let file_name = format!("{}_addresses_part_{:04}.csv.gz", chain, batch_num);
-    let file = File::create(&file_name)?;
-    let mut encoder = GzEncoder::new(file, Compression::default());
-
-    let mut content = Vec::new();
-    csv_resp.copy_to(&mut content)?;
-    let mut cursor = Cursor::new(content);
-    copy(&mut cursor, &mut encoder)?;
-    encoder.finish()?;
-
-    println!("\nSaved {}", file_name);
-
-    if let Some(tag) = release_tag {
-        let _ = upload_to_release(tag, &file_name);
-    }
-
-    Ok(true)
+    addrs
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = env::var("DUNE_API_KEY").expect("DUNE_API_KEY required");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let release_tag = env::var("RELEASE_TAG").ok();
     let chain = env::var("TARGET_CHAIN").unwrap_or_else(|_| "bnb".to_string());
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(180))
-        .build()?;
-
-    let (block_step, max_blocks) = match chain.as_str() {
-        "ethereum" => (1_000_000, 23_000_000),
-        "polygon" => (10_000_000, 68_000_000),
-        "arbitrum" => (10_000_000, 300_000_000),
-        "base" => (1_000_000, 25_000_000),
-        "optimism" => (10_000_000, 130_000_000),
-        "avalanche_c" => (10_000_000, 55_000_000),
-        _ => (10_000_000, 42_000_000), // BNB
+    // High performance Public EVM RPC URLs
+    let rpc_url = match chain.as_str() {
+        "bnb" => "https://binance.llamarpc.com",
+        "ethereum" => "https://cloudflare-eth.com",
+        "polygon" => "https://polygon-rpc.com",
+        "arbitrum" => "https://arb1.arbitrum.io/rpc",
+        "base" => "https://mainnet.base.org",
+        "optimism" => "https://mainnet.optimism.io",
+        "avalanche_c" => "https://api.avax.network/ext/bc/C/rpc",
+        _ => "https://binance.llamarpc.com",
     };
 
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()?;
+    let client = Arc::new(client);
+    let rpc_url = Arc::new(rpc_url.to_string());
+
+    // Current block height check karein
+    let block_res: Value = client
+        .post(rpc_url.as_str())
+        .json(&json!({"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let latest_hex = block_res["result"].as_str().unwrap_or("0x1");
+    let max_block = u64::from_str_radix(latest_hex.trim_start_matches("0x"), 16).unwrap_or(40_000_000);
+
+    println!("Target Chain: {} | RPC URL: {} | Max Block: {}", chain, rpc_url, max_block);
+
+    let part_size: u64 = 1_000_000; // 1000000 blocks per CSV Part
     let mut current_block: u64 = 0;
-    let mut batch_counter: u32 = 1;
+    let mut part_num: u32 = 1;
 
-    println!("Starting {} pipeline (Step: {}, Max: {})...", chain, block_step, max_blocks);
+    while current_block < max_block {
+        let end_block = (current_block + part_size).min(max_block);
+        println!("\n[Batch #{:04}] Processing blocks {} to {}...", part_num, current_block, end_block);
 
-    while current_block < max_blocks {
-        let next_block = (current_block + block_step).min(max_blocks);
-        let _ = fetch_batch(&client, &api_key, release_tag.as_deref(), &chain, current_block, next_block, batch_counter);
-        current_block = next_block;
-        batch_counter += 1;
-        sleep(Duration::from_secs(3));
+        // Group blocks into chunks of 20 for RPC JSON batching
+        let mut chunks = Vec::new();
+        let mut b = current_block;
+        while b < end_block {
+            let chunk_end = (b + 20).min(end_block);
+            chunks.push((b..chunk_end).collect::<Vec<u64>>());
+            b = chunk_end;
+        }
+
+        // Run 10 parallel async RPC workers concurrently
+        let results = stream::iter(chunks)
+            .map(|block_chunk| {
+                let client = Arc::clone(&client);
+                let rpc = Arc::clone(&rpc_url);
+                tokio::spawn(async move {
+                    fetch_rpc_batch_blocks(&client, &rpc, block_chunk).await
+                })
+            })
+            .buffer_unordered(10)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut unique_set: HashSet<String> = HashSet::new();
+        for res in results {
+            if let Ok(addresses) = res {
+                for addr in addresses {
+                    unique_set.insert(addr);
+                }
+            }
+        }
+
+        if !unique_set.is_empty() {
+            let file_name = format!("{}_addresses_part_{:04}.csv.gz", chain, part_num);
+            let file = File::create(&file_name)?;
+            let enc = GzEncoder::new(file, Compression::default());
+            let mut wtr = csv::Writer::from_writer(enc);
+
+            wtr.write_record(&["address"])?;
+            for addr in &unique_set {
+                wtr.write_record(&[addr])?;
+            }
+            wtr.flush()?;
+
+            println!("Saved {} unique addresses -> {}", unique_set.len(), file_name);
+
+            if let Some(tag) = release_tag.as_deref() {
+                upload_to_release(tag, &file_name);
+            }
+        }
+
+        current_block = end_block;
+        part_num += 1;
     }
 
-    println!("\nExtraction finished!");
+    println!("\nPipeline completed successfully!");
     Ok(())
 }
