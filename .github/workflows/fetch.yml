@@ -1,10 +1,10 @@
-name: EVM Address Extractor
+name: EVM 1 Million Blocks Extractor
 
 on:
   workflow_dispatch:
     inputs:
       chain:
-        description: 'Select Chain to extract'
+        description: 'Select EVM Chain to extract'
         required: true
         default: 'bnb'
         type: choice
@@ -27,7 +27,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
@@ -38,13 +38,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME="${{ inputs.chain }}-dump-$(date +'%Y%m%d_%H%M%S')"
-          gh release create "$TAG_NAME" --title "${{ inputs.chain }} Address Dump ($TAG_NAME)" --notes "Batch export for ${{ inputs.chain }}."
+          TAG_NAME="${{ inputs.chain }}-1M-dump-$(date +'%Y%m%d_%H%M%S')"
+          gh release create "$TAG_NAME" --title "${{ inputs.chain }} 1M Blocks Address Dump ($TAG_NAME)" --notes "1 Million blocks per file batch extraction for ${{ inputs.chain }}."
           echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
 
-      - name: Execute EVM Batch Fetcher
+      - name: Execute 1M Batch Engine
         env:
-          DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
           TARGET_CHAIN: ${{ inputs.chain }}
