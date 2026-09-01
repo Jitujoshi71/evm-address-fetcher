@@ -115,13 +115,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let (block_step, max_blocks) = match chain.as_str() {
-        "ethereum" => (250_000, 23_000_000),
-        "polygon" => (500_000, 68_000_000),
+        "ethereum" => (1_000_000, 23_000_000),
+        "polygon" => (1_000_000, 68_000_000),
         "arbitrum" => (2_000_000, 300_000_000),
-        "base" => (500_000, 25_000_000),
+        "base" => (1_000_000, 25_000_000),
         "optimism" => (1_000_000, 130_000_000),
-        "avalanche_c" => (500_000, 55_000_000),
-        _ => (500_000, 42_000_000), // BNB
+        "avalanche_c" => (1_000_000, 55_000_000),
+        _ => (1_000_000, 42_000_000), // BNB
     };
 
     let mut current_block: u64 = 0;
