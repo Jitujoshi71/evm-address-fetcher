@@ -1,0 +1,52 @@
+name: EVM Address Extractor
+
+on:
+  workflow_dispatch:
+    inputs:
+      chain:
+        description: 'Select Chain to extract'
+        required: true
+        default: 'bnb'
+        type: choice
+        options:
+          - bnb
+          - ethereum
+          - polygon
+          - arbitrum
+          - base
+          - optimism
+          - avalanche_c
+
+jobs:
+  run-batch-fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Create Base GitHub Release
+        id: create_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ inputs.chain }}-dump-$(date +'%Y%m%d_%H%M%S')"
+          gh release create "$TAG_NAME" --title "${{ inputs.chain }} Address Dump ($TAG_NAME)" --notes "Batch export for ${{ inputs.chain }}."
+          echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
+
+      - name: Execute EVM Batch Fetcher
+        env:
+          DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          TARGET_CHAIN: ${{ inputs.chain }}
+        run: |
+          cargo run --release
