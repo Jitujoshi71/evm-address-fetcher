@@ -1,10 +1,10 @@
-name: EVM Time-Range Blocks Extractor
+name: EVM Custom Date Range Extractor
 
 on:
   workflow_dispatch:
     inputs:
       chain:
-        description: 'Select EVM Chain to extract'
+        description: 'Select EVM Chain'
         required: true
         default: 'ethereum'
         type: choice
@@ -16,10 +16,16 @@ on:
           - base
           - optimism
           - avalanche_c
-      days:
-        description: 'Kitne pichle dino ka data chahiye'
+      start_date:
+        description: 'Start Date (Format: YYYY-MM-DD)'
         required: true
-        default: '30'
+        default: '2026-08-01'
+        type: string
+      end_date:
+        description: 'End Date (Format: YYYY-MM-DD)'
+        required: true
+        default: '2026-08-31'
+        type: string
 
 jobs:
   run-batch-fetch:
@@ -38,24 +44,44 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Convert Dates to Unix Timestamps
+        id: timestamps
+        run: |
+          # YYYY-MM-DD ko UTC Unix Timestamps me convert karein
+          START_TS=$(date -u -d "${{ inputs.start_date }} 00:00:00" +%s)
+          END_TS=$(date -u -d "${{ inputs.end_date }} 23:59:59" +%s)
+
+          if [ "$START_TS" -ge "$END_TS" ]; then
+            echo "Error: start_date must be before end_date"
+            exit 1
+          fi
+
+          echo "START_TS=$START_TS" >> $GITHUB_ENV
+          echo "END_TS=$END_TS" >> $GITHUB_ENV
+
       - name: Execute Extraction Engine
         env:
           TARGET_CHAIN: ${{ inputs.chain }}
-          DAYS_BACK: ${{ inputs.days }}
-          # Dedicated RPC zaroori hai (jaise Alchemy, QuickNode)
+          START_TIMESTAMP: ${{ env.START_TS }}
+          END_TIMESTAMP: ${{ env.END_TS }}
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
           RPC_URL: ${{ secrets.RPC_URL }}
         run: |
-          cargo run --release -- --chain "${{ inputs.chain }}" --days "${{ inputs.days }}"
-          
-          # Extracted raw files ko compress karna taaki disk space na bhare
+          cargo run --release -- \
+            --chain "${{ inputs.chain }}" \
+            --start-ts "${{ env.START_TS }}" \
+            --end-ts "${{ env.END_TS }}"
+
           mkdir -p ./dumps
-          tar -czf "./dumps/${{ inputs.chain }}-${{ inputs.days }}days.tar.gz" output/
+          FILE_NAME="${{ inputs.chain }}_${{ inputs.start_date }}_to_${{ inputs.end_date }}.tar.gz"
+          tar -czf "./dumps/$FILE_NAME" output/
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME="${{ inputs.chain }}-${{ inputs.days }}d-dump-$(date +'%Y%m%d_%H%M%S')"
+          TAG_NAME="${{ inputs.chain }}-${{ inputs.start_date }}-to-${{ inputs.end_date }}-$(date +'%s')"
           gh release create "$TAG_NAME" ./dumps/*.tar.gz \
-            --title "${{ inputs.chain }} Last ${{ inputs.days }} Days Dump" \
-            --notes "Extraction completed for ${{ inputs.chain }} covering the last ${{ inputs.days }} days."
+            --title "${{ inputs.chain }}: ${{ inputs.start_date }} to ${{ inputs.end_date }}" \
+            --notes "Data extraction completed for ${{ inputs.chain }} between ${{ inputs.start_date }} and ${{ inputs.end_date }} (UTC)."
