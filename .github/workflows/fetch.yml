@@ -1,4 +1,4 @@
-name: EVM 1 Million Blocks Extractor
+name: EVM Time-Range Blocks Extractor
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       chain:
         description: 'Select EVM Chain to extract'
         required: true
-        default: 'bnb'
+        default: 'ethereum'
         type: choice
         options:
           - bnb
@@ -16,10 +16,15 @@ on:
           - base
           - optimism
           - avalanche_c
+      days:
+        description: 'Kitne pichle dino ka data chahiye'
+        required: true
+        default: '30'
 
 jobs:
   run-batch-fetch:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     permissions:
       contents: write
 
@@ -33,19 +38,24 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Create Base GitHub Release
-        id: create_release
+      - name: Execute Extraction Engine
+        env:
+          TARGET_CHAIN: ${{ inputs.chain }}
+          DAYS_BACK: ${{ inputs.days }}
+          # Dedicated RPC zaroori hai (jaise Alchemy, QuickNode)
+          RPC_URL: ${{ secrets.RPC_URL }}
+        run: |
+          cargo run --release -- --chain "${{ inputs.chain }}" --days "${{ inputs.days }}"
+          
+          # Extracted raw files ko compress karna taaki disk space na bhare
+          mkdir -p ./dumps
+          tar -czf "./dumps/${{ inputs.chain }}-${{ inputs.days }}days.tar.gz" output/
+
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME="${{ inputs.chain }}-1M-dump-$(date +'%Y%m%d_%H%M%S')"
-          gh release create "$TAG_NAME" --title "${{ inputs.chain }} 1M Blocks Address Dump ($TAG_NAME)" --notes "1 Million blocks per file batch extraction for ${{ inputs.chain }}."
-          echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
-
-      - name: Execute 1M Batch Engine
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ env.RELEASE_TAG }}
-          TARGET_CHAIN: ${{ inputs.chain }}
-        run: |
-          cargo run --release
+          TAG_NAME="${{ inputs.chain }}-${{ inputs.days }}d-dump-$(date +'%Y%m%d_%H%M%S')"
+          gh release create "$TAG_NAME" ./dumps/*.tar.gz \
+            --title "${{ inputs.chain }} Last ${{ inputs.days }} Days Dump" \
+            --notes "Extraction completed for ${{ inputs.chain }} covering the last ${{ inputs.days }} days."
