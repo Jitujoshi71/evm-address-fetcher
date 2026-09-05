@@ -32,6 +32,7 @@ on:
 jobs:
   run-batch-fetch:
     runs-on: ubuntu-latest
+
     timeout-minutes: 350
 
     permissions:
@@ -39,32 +40,35 @@ jobs:
 
     steps:
 
-      # ============================================================
+      # ========================================================
       # CHECKOUT
-      # ============================================================
+      # ========================================================
 
       - name: Checkout Code
         uses: actions/checkout@v4
 
 
-      # ============================================================
+      # ========================================================
       # RUST
-      # ============================================================
+      # ========================================================
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
 
 
+      # ========================================================
+      # RUST CACHE
+      # ========================================================
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
 
-      # ============================================================
-      # VALIDATE DATES
-      # ============================================================
+      # ========================================================
+      # VALIDATE DATE + CONVERT TO UNIX TIMESTAMP
+      # ========================================================
 
       - name: Convert Dates To Unix Timestamps
-        id: timestamps
         shell: bash
         run: |
           set -euo pipefail
@@ -72,13 +76,27 @@ jobs:
           START_DATE="${{ inputs.start_date }}"
           END_DATE="${{ inputs.end_date }}"
 
-          if ! date -u -d "$START_DATE" >/dev/null 2>&1; then
-            echo "Invalid start date: $START_DATE"
+          echo "Checking dates..."
+
+          if ! [[ "$START_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "ERROR: Invalid start date format."
+            echo "Expected: YYYY-MM-DD"
             exit 1
           fi
 
-          if ! date -u -d "$END_DATE" >/dev/null 2>&1; then
-            echo "Invalid end date: $END_DATE"
+          if ! [[ "$END_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "ERROR: Invalid end date format."
+            echo "Expected: YYYY-MM-DD"
+            exit 1
+          fi
+
+          if ! date -u -d "$START_DATE 00:00:00" >/dev/null 2>&1; then
+            echo "ERROR: Invalid start date: $START_DATE"
+            exit 1
+          fi
+
+          if ! date -u -d "$END_DATE 23:59:59" >/dev/null 2>&1; then
+            echo "ERROR: Invalid end date: $END_DATE"
             exit 1
           fi
 
@@ -86,73 +104,47 @@ jobs:
           END_TS=$(date -u -d "$END_DATE 23:59:59" +%s)
 
           if [ "$START_TS" -gt "$END_TS" ]; then
-            echo "ERROR: start_date must not be after end_date"
+            echo "ERROR: start_date cannot be after end_date."
             exit 1
           fi
 
-          echo "Start date : $START_DATE"
-          echo "End date   : $END_DATE"
+          echo ""
+          echo "=============================================="
+          echo "DATE RANGE"
+          echo "=============================================="
+          echo "Start Date : $START_DATE"
+          echo "End Date   : $END_DATE"
           echo "Start TS   : $START_TS"
           echo "End TS     : $END_TS"
+          echo "=============================================="
 
           echo "START_TS=$START_TS" >> "$GITHUB_ENV"
           echo "END_TS=$END_TS" >> "$GITHUB_ENV"
 
 
-      # ============================================================
-      # CREATE RELEASE TAG
-      # ============================================================
-
-      - name: Create Release
-        id: release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TAG_NAME="${{ inputs.chain }}-${{ inputs.start_date }}-to-${{ inputs.end_date }}-$(date +%s)"
-
-          gh release create "$TAG_NAME" \
-            --title "${{ inputs.chain }}: ${{ inputs.start_date }} to ${{ inputs.end_date }}" \
-            --notes "Unique from/to EVM addresses extracted for ${{ inputs.chain }} from ${{ inputs.start_date }} through ${{ inputs.end_date }} UTC."
-
-          echo "RELEASE_TAG=$TAG_NAME" >> "$GITHUB_ENV"
-
-
-      # ============================================================
-      # RUN RUST EXTRACTOR
-      # ============================================================
+      # ========================================================
+      # RUN EXTRACTION
+      # ========================================================
 
       - name: Execute Extraction Engine
         env:
           TARGET_CHAIN: ${{ inputs.chain }}
           START_TIMESTAMP: ${{ env.START_TS }}
           END_TIMESTAMP: ${{ env.END_TS }}
-          START_DATE: ${{ inputs.start_date }}
-          END_DATE: ${{ inputs.end_date }}
-          RELEASE_TAG: ${{ env.RELEASE_TAG }}
 
-          # Optional:
-          # If RPC_URL secret is present, Rust will use it first.
           RPC_URL: ${{ secrets.RPC_URL }}
-
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
         shell: bash
         run: |
           set -euo pipefail
 
+          echo ""
           echo "======================================================"
           echo "STARTING EVM ADDRESS EXTRACTION"
           echo "======================================================"
-
-          echo "Chain       : $TARGET_CHAIN"
-          echo "Start Date  : $START_DATE"
-          echo "End Date    : $END_DATE"
-          echo "Start TS    : $START_TIMESTAMP"
-          echo "End TS      : $END_TIMESTAMP"
-          echo "Release     : $RELEASE_TAG"
+          echo "Chain      : $TARGET_CHAIN"
+          echo "Start TS   : $START_TIMESTAMP"
+          echo "End TS     : $END_TIMESTAMP"
           echo "======================================================"
 
           cargo run --release -- \
@@ -160,48 +152,72 @@ jobs:
             --start-ts "$START_TIMESTAMP" \
             --end-ts "$END_TIMESTAMP"
 
+          echo ""
           echo "======================================================"
-          echo "EXTRACTION FINISHED"
+          echo "RUST EXTRACTION FINISHED"
           echo "======================================================"
 
-          mkdir -p dumps
-
-          FILE_NAME="${TARGET_CHAIN}_${START_DATE}_to_${END_DATE}.tar.gz"
-
-          tar -czf "dumps/$FILE_NAME" output/
-
-          echo "Archive created:"
-          ls -lh "dumps/$FILE_NAME"
+          echo ""
+          echo "OUTPUT FILES:"
+          find output -maxdepth 1 -type f -printf "%f %s bytes\n" | sort || true
 
 
-      # ============================================================
-      # UPLOAD FINAL SINGLE ARCHIVE
-      # ============================================================
+      # ========================================================
+      # CREATE ARCHIVE
+      # ========================================================
 
-      - name: Upload Final Archive
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create Final Archive
         shell: bash
         run: |
           set -euo pipefail
 
-          FILE=$(find dumps -maxdepth 1 -type f -name "*.tar.gz" | head -n 1)
+          mkdir -p dumps
 
-          if [ -z "$FILE" ]; then
-            echo "ERROR: archive not found"
+          if [ ! -d "output" ]; then
+            echo "ERROR: output directory does not exist."
             exit 1
           fi
 
-          echo "Uploading:"
-          ls -lh "$FILE"
+          FILE_NAME="${{ inputs.chain }}_${{ inputs.start_date }}_to_${{ inputs.end_date }}.tar.gz"
 
-          gh release upload \
-            "$RELEASE_TAG" \
-            "$FILE" \
-            --clobber
+          echo ""
+          echo "Creating archive:"
+          echo "dumps/$FILE_NAME"
 
+          tar -czf "dumps/$FILE_NAME" output/
+
+          echo ""
+          echo "Archive created successfully:"
+          ls -lh "dumps/$FILE_NAME"
+
+
+      # ========================================================
+      # CREATE GITHUB RELEASE
+      # ========================================================
+
+      - name: Create GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${{ inputs.chain }}-${{ inputs.start_date }}-to-${{ inputs.end_date }}-$(date +%s)"
+
+          echo ""
+          echo "Creating GitHub Release:"
+          echo "$TAG_NAME"
+
+          gh release create "$TAG_NAME" \
+            "dumps/${{ inputs.chain }}_${{ inputs.start_date }}_to_${{ inputs.end_date }}.tar.gz" \
+            --title "${{ inputs.chain }}: ${{ inputs.start_date }} to ${{ inputs.end_date }}" \
+            --notes "Unique from/to EVM transaction addresses extracted from ${{ inputs.start_date }} 00:00:00 UTC through ${{ inputs.end_date }} 23:59:59 UTC."
+
+          echo ""
           echo "======================================================"
-          echo "RELEASE UPLOAD COMPLETE"
+          echo "RELEASE CREATED SUCCESSFULLY"
           echo "======================================================"
 
-          gh release view "$RELEASE_TAG"
+          gh release view "$TAG_NAME"
