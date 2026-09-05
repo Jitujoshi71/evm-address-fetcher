@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,11 +16,12 @@ use tokio::time::sleep;
 
 
 // ============================================================
-// CONFIG
+// CONFIGURATION
 // ============================================================
 
-const BLOCK_CHUNK: u64 = 1_000_000;
-const RPC_BATCH_SIZE: u64 = 25;
+const BLOCKS_PER_PART: u64 = 1_000_000;
+const BLOCKS_PER_RPC_BATCH: u64 = 25;
+
 const CONCURRENCY: usize = 12;
 
 const MAX_RPC_RETRIES: usize = 3;
@@ -30,72 +30,71 @@ const RPC_TIMEOUT_SECONDS: u64 = 45;
 
 
 // ============================================================
-// RPC URLS
+// RPC LIST
 // ============================================================
 
 fn get_rpc_list(chain: &str) -> Vec<String> {
-
-    // User supplied RPC gets priority.
     let mut list = Vec::new();
 
+    // User supplied RPC gets priority.
     if let Ok(custom_rpc) = env::var("RPC_URL") {
-        let rpc = custom_rpc.trim().to_string();
+        let rpc = custom_rpc.trim();
 
         if !rpc.is_empty() {
-            list.push(rpc);
+            list.push(rpc.to_string());
         }
     }
 
     let defaults: Vec<String> = match chain {
-
         "bnb" => vec![
-            "https://bsc-dataseed.binance.org/".into(),
-            "https://bsc-dataseed1.defibit.io/".into(),
-            "https://bsc-dataseed1.ninicoin.io/".into(),
-            "https://rpc.ankr.com/bsc".into(),
-            "https://1rpc.io/bnb".into(),
+            "https://bsc-dataseed.binance.org/".to_string(),
+            "https://bsc-dataseed1.defibit.io/".to_string(),
+            "https://bsc-dataseed1.ninicoin.io/".to_string(),
+            "https://rpc.ankr.com/bsc".to_string(),
+            "https://1rpc.io/bnb".to_string(),
         ],
 
         "ethereum" => vec![
-            "https://eth.llamarpc.com".into(),
-            "https://cloudflare-eth.com".into(),
-            "https://rpc.ankr.com/eth".into(),
-            "https://1rpc.io/eth".into(),
+            "https://eth.llamarpc.com".to_string(),
+            "https://cloudflare-eth.com".to_string(),
+            "https://rpc.ankr.com/eth".to_string(),
+            "https://1rpc.io/eth".to_string(),
         ],
 
         "polygon" => vec![
-            "https://polygon-rpc.com".into(),
-            "https://rpc.ankr.com/polygon".into(),
-            "https://1rpc.io/matic".into(),
+            "https://polygon-rpc.com".to_string(),
+            "https://rpc.ankr.com/polygon".to_string(),
+            "https://1rpc.io/matic".to_string(),
         ],
 
         "arbitrum" => vec![
-            "https://arb1.arbitrum.io/rpc".into(),
-            "https://rpc.ankr.com/arbitrum".into(),
-            "https://1rpc.io/arb".into(),
+            "https://arb1.arbitrum.io/rpc".to_string(),
+            "https://rpc.ankr.com/arbitrum".to_string(),
+            "https://1rpc.io/arb".to_string(),
         ],
 
         "base" => vec![
-            "https://mainnet.base.org".into(),
-            "https://base.llamarpc.com".into(),
-            "https://1rpc.io/base".into(),
+            "https://mainnet.base.org".to_string(),
+            "https://base.llamarpc.com".to_string(),
+            "https://1rpc.io/base".to_string(),
         ],
 
         "optimism" => vec![
-            "https://mainnet.optimism.io".into(),
-            "https://optimism.llamarpc.com".into(),
-            "https://1rpc.io/op".into(),
+            "https://mainnet.optimism.io".to_string(),
+            "https://optimism.llamarpc.com".to_string(),
+            "https://1rpc.io/op".to_string(),
         ],
 
         "avalanche_c" => vec![
-            "https://api.avax.network/ext/bc/C/rpc".into(),
-            "https://rpc.ankr.com/avalanche".into(),
-            "https://1rpc.io/avax/c".into(),
+            "https://api.avax.network/ext/bc/C/rpc".to_string(),
+            "https://rpc.ankr.com/avalanche".to_string(),
+            "https://1rpc.io/avax/c".to_string(),
         ],
 
-        _ => vec![
-            "https://bsc-dataseed.binance.org/".into(),
-        ],
+        _ => {
+            return Err(format!("Unsupported chain: {}", chain))
+                .unwrap_or_else(|_| vec![]);
+        }
     };
 
     for rpc in defaults {
@@ -109,19 +108,18 @@ fn get_rpc_list(chain: &str) -> Vec<String> {
 
 
 // ============================================================
-// HEX → U64
+// HEX TO U64
 // ============================================================
 
 fn hex_to_u64(value: &str) -> Option<u64> {
+    let clean = value.trim_start_matches("0x");
 
-    let value = value.trim_start_matches("0x");
-
-    u64::from_str_radix(value, 16).ok()
+    u64::from_str_radix(clean, 16).ok()
 }
 
 
 // ============================================================
-// SINGLE RPC CALL
+// GENERIC RPC CALL
 // ============================================================
 
 async fn rpc_call(
@@ -129,77 +127,60 @@ async fn rpc_call(
     rpc_urls: &[String],
     payload: Value,
 ) -> Result<Value, String> {
-
-    let mut last_error = String::from("unknown RPC error");
+    let mut last_error = String::from("Unknown RPC error");
 
     for rpc in rpc_urls {
-
         for attempt in 1..=MAX_RPC_RETRIES {
-
-            let response = client
+            match client
                 .post(rpc)
                 .json(&payload)
                 .send()
-                .await;
-
-            match response {
-
-                Ok(resp) => {
-
-                    let status = resp.status();
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
 
                     if !status.is_success() {
-
                         last_error = format!(
-                            "RPC {} HTTP status {}",
+                            "{} returned HTTP {}",
                             rpc,
                             status
                         );
-
                     } else {
-
-                        match resp.json::<Value>().await {
-
+                        match response.json::<Value>().await {
                             Ok(value) => {
-
                                 if value.get("error").is_some() {
-
                                     last_error = format!(
-                                        "RPC {} returned error: {}",
+                                        "{} returned RPC error: {}",
                                         rpc,
                                         value["error"]
                                     );
-
                                 } else {
-
                                     return Ok(value);
                                 }
                             }
 
-                            Err(e) => {
-
+                            Err(error) => {
                                 last_error = format!(
-                                    "RPC {} invalid JSON: {}",
+                                    "{} returned invalid JSON: {}",
                                     rpc,
-                                    e
+                                    error
                                 );
                             }
                         }
                     }
                 }
 
-                Err(e) => {
-
+                Err(error) => {
                     last_error = format!(
-                        "RPC {} request error: {}",
+                        "{} request failed: {}",
                         rpc,
-                        e
+                        error
                     );
                 }
             }
 
             if attempt < MAX_RPC_RETRIES {
-
                 sleep(Duration::from_millis(
                     300 * attempt as u64
                 ))
@@ -208,53 +189,12 @@ async fn rpc_call(
         }
 
         eprintln!(
-            "RPC failed, trying next RPC: {}",
+            "RPC failed, switching to next RPC: {}",
             rpc
         );
     }
 
     Err(last_error)
-}
-
-
-// ============================================================
-// GET BLOCK TIMESTAMP
-// ============================================================
-
-async fn get_block_timestamp(
-    client: &reqwest::Client,
-    rpc_urls: &[String],
-    block: u64,
-) -> Result<u64, String> {
-
-    let payload = json!({
-        "jsonrpc": "2.0",
-        "method": "eth_getBlockByNumber",
-        "params": [
-            format!("0x{:x}", block),
-            false
-        ],
-        "id": 1
-    });
-
-    let response = rpc_call(
-        client,
-        rpc_urls,
-        payload
-    )
-    .await?;
-
-    let result = response
-        .get("result")
-        .ok_or("Missing result")?;
-
-    let timestamp_hex = result
-        .get("timestamp")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing block timestamp")?;
-
-    hex_to_u64(timestamp_hex)
-        .ok_or_else(|| "Invalid timestamp".to_string())
 }
 
 
@@ -266,7 +206,6 @@ async fn get_latest_block(
     client: &reqwest::Client,
     rpc_urls: &[String],
 ) -> Result<u64, String> {
-
     let payload = json!({
         "jsonrpc": "2.0",
         "method": "eth_blockNumber",
@@ -284,32 +223,81 @@ async fn get_latest_block(
     let result = response
         .get("result")
         .and_then(|v| v.as_str())
-        .ok_or("Missing latest block result")?;
+        .ok_or_else(|| {
+            "Missing eth_blockNumber result".to_string()
+        })?;
 
     hex_to_u64(result)
-        .ok_or_else(|| "Invalid latest block".to_string())
+        .ok_or_else(|| {
+            "Invalid latest block number".to_string()
+        })
 }
 
 
 // ============================================================
-// FIND FIRST BLOCK AT / AFTER TIMESTAMP
+// GET BLOCK TIMESTAMP
 // ============================================================
 
-async fn find_block_by_timestamp(
+async fn get_block_timestamp(
+    client: &reqwest::Client,
+    rpc_urls: &[String],
+    block: u64,
+) -> Result<u64, String> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": "eth_getBlockByNumber",
+        "params": [
+            format!("0x{:x}", block),
+            false
+        ],
+        "id": block
+    });
+
+    let response = rpc_call(
+        client,
+        rpc_urls,
+        payload
+    )
+    .await?;
+
+    let result = response
+        .get("result")
+        .ok_or_else(|| {
+            format!("Block {} has no result", block)
+        })?;
+
+    let timestamp_hex = result
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "Block {} has no timestamp",
+                block
+            )
+        })?;
+
+    hex_to_u64(timestamp_hex)
+        .ok_or_else(|| {
+            format!(
+                "Invalid timestamp in block {}",
+                block
+            )
+        })
+}
+
+
+// ============================================================
+// FIND FIRST BLOCK WITH TIMESTAMP >= TARGET
+// ============================================================
+
+async fn find_first_block_at_or_after(
     client: &reqwest::Client,
     rpc_urls: &[String],
     target_timestamp: u64,
     mut low: u64,
     mut high: u64,
 ) -> Result<u64, String> {
-
-    println!(
-        "Searching block for timestamp {}...",
-        target_timestamp
-    );
-
     while low < high {
-
         let mid = low + (high - low) / 2;
 
         let timestamp = get_block_timestamp(
@@ -319,19 +307,9 @@ async fn find_block_by_timestamp(
         )
         .await?;
 
-        println!(
-            "Binary search: block={} timestamp={} target={}",
-            mid,
-            timestamp,
-            target_timestamp
-        );
-
         if timestamp < target_timestamp {
-
             low = mid + 1;
-
         } else {
-
             high = mid;
         }
     }
@@ -341,7 +319,7 @@ async fn find_block_by_timestamp(
 
 
 // ============================================================
-// FETCH BLOCK BATCH
+// FETCH 25 BLOCKS
 // ============================================================
 
 async fn fetch_rpc_batch_blocks(
@@ -349,15 +327,13 @@ async fn fetch_rpc_batch_blocks(
     rpc_urls: &[String],
     blocks: Vec<u64>,
 ) -> Result<Vec<String>, String> {
-
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
 
-    let batch_payload: Vec<Value> = blocks
+    let payload: Vec<Value> = blocks
         .iter()
-        .map(|&block| {
-
+        .map(|block| {
             json!({
                 "jsonrpc": "2.0",
                 "method": "eth_getBlockByNumber",
@@ -370,76 +346,76 @@ async fn fetch_rpc_batch_blocks(
         })
         .collect();
 
-    let mut last_error = String::new();
+    let mut last_error =
+        String::from("Batch request failed");
 
     for rpc in rpc_urls {
-
         for attempt in 1..=MAX_RPC_RETRIES {
-
-            let response = client
+            match client
                 .post(rpc)
-                .json(&batch_payload)
+                .json(&payload)
                 .send()
-                .await;
-
-            match response {
-
-                Ok(resp) => {
-
-                    if !resp.status().is_success() {
-
+                .await
+            {
+                Ok(response) => {
+                    if !response.status().is_success() {
                         last_error = format!(
                             "{} HTTP {}",
                             rpc,
-                            resp.status()
+                            response.status()
                         );
-
                     } else {
+                        match response
+                            .json::<Vec<Value>>()
+                            .await
+                        {
+                            Ok(results) => {
+                                let mut addresses =
+                                    Vec::new();
 
-                        match resp.json::<Vec<Value>>().await {
-
-                            Ok(items) => {
-
-                                let mut addresses = Vec::new();
-
-                                let mut received_blocks =
+                                let mut received =
                                     HashSet::<u64>::new();
 
-                                for item in items {
-
+                                for item in results {
                                     if item.get("error").is_some() {
-
-                                        last_error = format!(
-                                            "{} returned RPC error: {}",
-                                            rpc,
-                                            item["error"]
-                                        );
+                                        last_error =
+                                            format!(
+                                                "{} RPC error: {}",
+                                                rpc,
+                                                item["error"]
+                                            );
 
                                         continue;
                                     }
 
-                                    let block_number =
-                                        item.get("result")
-                                            .and_then(|r| r.get("number"))
-                                            .and_then(|n| n.as_str())
-                                            .and_then(hex_to_u64);
+                                    let result =
+                                        match item.get("result") {
+                                            Some(value)
+                                                if !value.is_null() =>
+                                            {
+                                                value
+                                            }
 
-                                    if let Some(block_number) =
-                                        block_number
+                                            _ => {
+                                                continue;
+                                            }
+                                        };
+
+                                    if let Some(number) =
+                                        result
+                                            .get("number")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(hex_to_u64)
                                     {
-                                        received_blocks.insert(
-                                            block_number
-                                        );
+                                        received.insert(number);
                                     }
 
-                                    if let Some(txs) =
-                                        item.get("result")
-                                            .and_then(|r| r.get("transactions"))
-                                            .and_then(|t| t.as_array())
+                                    if let Some(transactions) =
+                                        result
+                                            .get("transactions")
+                                            .and_then(|v| v.as_array())
                                     {
-
-                                        for tx in txs {
-
+                                        for tx in transactions {
                                             if let Some(from) =
                                                 tx.get("from")
                                                     .and_then(|v| v.as_str())
@@ -461,48 +437,40 @@ async fn fetch_rpc_batch_blocks(
                                     }
                                 }
 
-                                // IMPORTANT:
-                                // Don't silently accept partial RPC response.
-                                let expected =
-                                    blocks.len();
-
-                                if received_blocks.len() == expected {
-
+                                // Never silently accept partial batch.
+                                if received.len() == blocks.len() {
                                     return Ok(addresses);
                                 }
 
                                 last_error = format!(
-                                    "{} returned only {}/{} requested blocks",
+                                    "{} returned {}/{} blocks",
                                     rpc,
-                                    received_blocks.len(),
-                                    expected
+                                    received.len(),
+                                    blocks.len()
                                 );
                             }
 
-                            Err(e) => {
-
+                            Err(error) => {
                                 last_error = format!(
-                                    "{} invalid batch JSON: {}",
+                                    "{} invalid JSON: {}",
                                     rpc,
-                                    e
+                                    error
                                 );
                             }
                         }
                     }
                 }
 
-                Err(e) => {
-
+                Err(error) => {
                     last_error = format!(
                         "{} request failed: {}",
                         rpc,
-                        e
+                        error
                     );
                 }
             }
 
             if attempt < MAX_RPC_RETRIES {
-
                 sleep(Duration::from_millis(
                     500 * attempt as u64
                 ))
@@ -511,8 +479,8 @@ async fn fetch_rpc_batch_blocks(
         }
 
         eprintln!(
-            "Batch RPC failed: {}",
-            last_error
+            "Batch failed on RPC: {}",
+            rpc
         );
     }
 
@@ -524,23 +492,25 @@ async fn fetch_rpc_batch_blocks(
 // CHECKPOINT
 // ============================================================
 
-fn checkpoint_path() -> &'static str {
+fn checkpoint_file() -> &'static str {
     "output/checkpoint.txt"
 }
 
 
-fn save_checkpoint(block: u64) -> Result<(), Box<dyn std::error::Error>> {
-
-    let tmp = "output/checkpoint.tmp";
+fn save_checkpoint(
+    block: u64
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp =
+        "output/checkpoint.tmp";
 
     fs::write(
-        tmp,
+        temp,
         block.to_string()
     )?;
 
     fs::rename(
-        tmp,
-        checkpoint_path()
+        temp,
+        checkpoint_file()
     )?;
 
     Ok(())
@@ -548,15 +518,38 @@ fn save_checkpoint(block: u64) -> Result<(), Box<dyn std::error::Error>> {
 
 
 fn load_checkpoint() -> Option<u64> {
-
-    if !Path::new(checkpoint_path()).exists() {
+    if !Path::new(checkpoint_file()).exists() {
         return None;
     }
 
     let content =
-        fs::read_to_string(checkpoint_path()).ok()?;
+        fs::read_to_string(checkpoint_file())
+            .ok()?;
 
     content.trim().parse::<u64>().ok()
+}
+
+
+// ============================================================
+// FIND NEXT PART NUMBER
+// ============================================================
+
+fn next_part_number(chain: &str) -> u32 {
+    let mut part = 1u32;
+
+    loop {
+        let path = format!(
+            "output/{}_addresses_1M_part_{:03}.csv.gz",
+            chain,
+            part
+        );
+
+        if !Path::new(&path).exists() {
+            return part;
+        }
+
+        part += 1;
+    }
 }
 
 
@@ -566,17 +559,17 @@ fn load_checkpoint() -> Option<u64> {
 
 fn write_addresses_file(
     chain: &str,
-    part_num: u32,
-    unique_set: &HashSet<String>,
+    part: u32,
+    addresses: &HashSet<String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-
     let file_name = format!(
         "output/{}_addresses_1M_part_{:03}.csv.gz",
         chain,
-        part_num
+        part
     );
 
-    let file = File::create(&file_name)?;
+    let file =
+        File::create(&file_name)?;
 
     let encoder =
         GzEncoder::new(
@@ -585,20 +578,22 @@ fn write_addresses_file(
         );
 
     let mut writer =
-        csv::Writer::from_writer(encoder);
+        csv::Writer::from_writer(
+            encoder
+        );
 
     writer.write_record(["address"])?;
 
-    for address in unique_set {
-
+    for address in addresses {
         writer.write_record([address])?;
     }
 
     writer.flush()?;
 
     let encoder =
-        writer.into_inner()
-            .map_err(|e| e.into_error())?;
+        writer
+            .into_inner()
+            .map_err(|error| error.into_error())?;
 
     encoder.finish()?;
 
@@ -611,107 +606,118 @@ fn write_addresses_file(
 // ============================================================
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-    // --------------------------------------------------------
-    // CLI ARGUMENTS
-    // --------------------------------------------------------
+async fn main()
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    // ========================================================
+    // ARGUMENTS
+    // ========================================================
 
     let args: Vec<String> =
         env::args().collect();
 
     let mut chain =
         env::var("TARGET_CHAIN")
-            .unwrap_or_else(|_| "bnb".to_string());
+            .unwrap_or_else(
+                |_| "bnb".to_string()
+            );
 
     let mut start_ts =
         env::var("START_TIMESTAMP")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok());
+            .and_then(
+                |v| v.parse::<u64>().ok()
+            );
 
     let mut end_ts =
         env::var("END_TIMESTAMP")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok());
+            .and_then(
+                |v| v.parse::<u64>().ok()
+            );
 
 
-    let mut i = 1;
+    let mut index = 1usize;
 
-    while i < args.len() {
-
-        match args[i].as_str() {
-
+    while index < args.len() {
+        match args[index].as_str() {
             "--chain" => {
+                index += 1;
 
-                i += 1;
-
-                if i < args.len() {
-                    chain = args[i].clone();
+                if index < args.len() {
+                    chain =
+                        args[index].clone();
                 }
             }
 
             "--start-ts" => {
+                index += 1;
 
-                i += 1;
-
-                if i < args.len() {
-
-                    start_ts =
-                        Some(
-                            args[i].parse::<u64>()?
-                        );
+                if index < args.len() {
+                    start_ts = Some(
+                        args[index]
+                            .parse::<u64>()?
+                    );
                 }
             }
 
             "--end-ts" => {
+                index += 1;
 
-                i += 1;
-
-                if i < args.len() {
-
-                    end_ts =
-                        Some(
-                            args[i].parse::<u64>()?
-                        );
+                if index < args.len() {
+                    end_ts = Some(
+                        args[index]
+                            .parse::<u64>()?
+                    );
                 }
             }
 
             _ => {}
         }
 
-        i += 1;
+        index += 1;
     }
 
 
     let start_ts =
-        start_ts.ok_or("START_TIMESTAMP missing")?;
+        start_ts.ok_or(
+            "Missing --start-ts / START_TIMESTAMP"
+        )?;
 
     let end_ts =
-        end_ts.ok_or("END_TIMESTAMP missing")?;
+        end_ts.ok_or(
+            "Missing --end-ts / END_TIMESTAMP"
+        )?;
 
 
     if start_ts > end_ts {
-
         return Err(
-            "Start timestamp is greater than end timestamp"
+            "Start timestamp cannot be greater than end timestamp"
                 .into()
         );
     }
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // OUTPUT DIRECTORY
-    // --------------------------------------------------------
+    // ========================================================
 
     fs::create_dir_all("output")?;
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // RPC
-    // --------------------------------------------------------
+    // ========================================================
 
     let rpc_list =
         get_rpc_list(&chain);
+
+    if rpc_list.is_empty() {
+        return Err(
+            "No RPC endpoints configured".into()
+        );
+    }
+
 
     println!();
     println!("=======================================================");
@@ -721,21 +727,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Start TS    : {}", start_ts);
     println!("End TS      : {}", end_ts);
     println!("RPC count   : {}", rpc_list.len());
+    println!("Blocks/part : {}", BLOCKS_PER_PART);
+    println!("RPC batch   : {}", BLOCKS_PER_RPC_BATCH);
+    println!("Concurrency : {}", CONCURRENCY);
     println!("=======================================================");
 
-    for (index, rpc) in rpc_list.iter().enumerate() {
 
+    for (i, rpc) in rpc_list.iter().enumerate() {
         println!(
             "RPC #{}: {}",
-            index + 1,
+            i + 1,
             rpc
         );
     }
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // HTTP CLIENT
-    // --------------------------------------------------------
+    // ========================================================
 
     let client = reqwest::Client::builder()
         .timeout(
@@ -753,9 +762,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(rpc_list);
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // LATEST BLOCK
-    // --------------------------------------------------------
+    // ========================================================
 
     let latest_block =
         get_latest_block(
@@ -766,17 +775,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "Latest chain block: {}",
+        "Latest block: {}",
         latest_block
     );
 
 
-    // --------------------------------------------------------
-    // FIND START BLOCK
-    // --------------------------------------------------------
+    // ========================================================
+    // DATE → START BLOCK
+    // ========================================================
+
+    println!();
+    println!(
+        "Finding START block for timestamp {}...",
+        start_ts
+    );
 
     let start_block =
-        find_block_by_timestamp(
+        find_first_block_at_or_after(
             &client,
             &rpc_list,
             start_ts,
@@ -786,15 +801,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
 
-    // --------------------------------------------------------
-    // FIND END BLOCK
-    // --------------------------------------------------------
+    // ========================================================
+    // DATE → END BLOCK
+    //
+    // We search for END_TIMESTAMP + 1.
+    // Therefore all blocks with timestamp <= END_TIMESTAMP
+    // are included.
+    // ========================================================
 
-    let end_block =
-        find_block_by_timestamp(
+    println!();
+    println!(
+        "Finding END block for timestamp {}...",
+        end_ts
+    );
+
+    let end_search_timestamp =
+        end_ts.saturating_add(1);
+
+    let first_after_end =
+        find_first_block_at_or_after(
             &client,
             &rpc_list,
-            end_ts.saturating_add(1),
+            end_search_timestamp,
             start_block,
             latest_block
         )
@@ -802,94 +830,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     let end_block =
-        end_block.saturating_sub(1);
+        if first_after_end > 0 {
+            first_after_end - 1
+        } else {
+            0
+        };
 
+
+    // ========================================================
+    // RANGE CHECK
+    // ========================================================
 
     println!();
     println!("=======================================================");
-    println!("DATE → BLOCK MAPPING");
+    println!("DATE → BLOCK RESULT");
     println!("=======================================================");
     println!("Start Block : {}", start_block);
     println!("End Block   : {}", end_block);
-    println!("Blocks      : {}", end_block.saturating_sub(start_block) + 1);
+
+    if start_block <= end_block {
+        println!(
+            "Total Blocks: {}",
+            end_block - start_block + 1
+        );
+    } else {
+        println!("Total Blocks: 0");
+    }
+
     println!("=======================================================");
 
 
     if start_block > end_block {
-
         println!(
-            "No blocks found in requested date range."
+            "No blocks exist in the requested date range."
         );
 
         return Ok(());
     }
 
 
-    // --------------------------------------------------------
-    // RESUME
-    // --------------------------------------------------------
+    // ========================================================
+    // RESUME CHECKPOINT
+    // ========================================================
 
     let mut current_block =
         match load_checkpoint() {
-
-            Some(saved) => {
-
+            Some(saved)
                 if saved >= start_block
-                    && saved <= end_block + 1
-                {
-                    println!(
-                        "Resuming from checkpoint block {}",
-                        saved
-                    );
-
+                    && saved <= end_block + 1 =>
+            {
+                println!(
+                    "Resuming from checkpoint: {}",
                     saved
-                } else {
+                );
 
-                    start_block
-                }
+                saved
             }
 
-            None => start_block,
+            _ => {
+                println!(
+                    "Starting extraction from block {}",
+                    start_block
+                );
+
+                start_block
+            }
         };
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // PART NUMBER
-    // --------------------------------------------------------
+    // ========================================================
 
-    let mut part_num: u32 = 1;
-
-
-    // If previous files exist, determine next part.
-    while Path::new(
-        &format!(
-            "output/{}_addresses_1M_part_{:03}.csv.gz",
-            chain,
-            part_num
-        )
-    )
-    .exists()
-    {
-        part_num += 1;
-    }
+    let mut part_num =
+        next_part_number(&chain);
 
 
-    // --------------------------------------------------------
-    // MAIN EXTRACTION
-    // --------------------------------------------------------
+    // ========================================================
+    // MAIN EXTRACTION LOOP
+    // ========================================================
 
     while current_block <= end_block {
-
         let chunk_end =
             current_block
-                .saturating_add(BLOCK_CHUNK - 1)
+                .saturating_add(
+                    BLOCKS_PER_PART - 1
+                )
                 .min(end_block);
 
 
         println!();
         println!("=======================================================");
         println!(
-            "[PART {:03}] BLOCKS {} → {}",
+            "[PART {:03}] {} → {}",
             part_num,
             current_block,
             chunk_end
@@ -898,23 +931,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
         // ----------------------------------------------------
-        // CREATE 25 BLOCK MICRO CHUNKS
+        // CREATE MICRO BATCHES
         // ----------------------------------------------------
 
         let mut micro_chunks:
-            Vec<Vec<u64>> = Vec::new();
+            Vec<Vec<u64>> =
+            Vec::new();
 
-        let mut b =
+        let mut block =
             current_block;
 
-        while b <= chunk_end {
-
+        while block <= chunk_end {
             let micro_end =
-                b.saturating_add(RPC_BATCH_SIZE - 1)
+                block
+                    .saturating_add(
+                        BLOCKS_PER_RPC_BATCH - 1
+                    )
                     .min(chunk_end);
 
             micro_chunks.push(
-                (b..=micro_end)
+                (block..=micro_end)
                     .collect()
             );
 
@@ -922,18 +958,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            b = micro_end + 1;
+            block =
+                micro_end + 1;
         }
+
+
+        let total_batches =
+            micro_chunks.len();
 
 
         println!(
             "Micro batches: {}",
-            micro_chunks.len()
+            total_batches
         );
 
 
         // ----------------------------------------------------
-        // UNIQUE ADDRESS SET
+        // UNIQUE ADDRESSES
         // ----------------------------------------------------
 
         let mut unique_set:
@@ -942,7 +983,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
         // ----------------------------------------------------
-        // CONCURRENT RPC
+        // CONCURRENT RPC STREAM
         // ----------------------------------------------------
 
         let mut stream =
@@ -950,7 +991,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 micro_chunks
             )
             .map(|chunk| {
-
                 let client =
                     Arc::clone(&client);
 
@@ -959,7 +999,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 tokio::spawn(
                     async move {
-
                         fetch_rpc_batch_blocks(
                             &client,
                             &rpcs,
@@ -974,35 +1013,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
 
-        let mut processed_batches:
-            usize = 0;
+        // ----------------------------------------------------
+        // PROCESS RESULTS
+        // ----------------------------------------------------
 
-        let total_batches =
-            stream.size_hint().1.unwrap_or(0);
-
+        let mut processed_batches =
+            0usize;
 
         while let Some(result) =
             stream.next().await
         {
-
             let addresses =
                 result
-                    .map_err(|e| {
+                    .map_err(|error| {
                         format!(
                             "Worker task failed: {}",
-                            e
+                            error
                         )
                     })?
-                    .map_err(|e| {
+                    .map_err(|error| {
                         format!(
-                            "RPC batch permanently failed: {}",
-                            e
+                            "RPC batch failed permanently: {}",
+                            error
                         )
                     })?;
 
 
             for address in addresses {
-
                 unique_set.insert(
                     address
                 );
@@ -1012,12 +1049,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             processed_batches += 1;
 
 
-            if processed_batches % 1000 == 0 {
+            if processed_batches % 1000 == 0
+                || processed_batches == total_batches
+            {
+                let percentage =
+                    (
+                        processed_batches as f64
+                        /
+                        total_batches as f64
+                    ) * 100.0;
 
                 println!(
-                    "Progress: {}/{} batches | Unique addresses: {}",
+                    "Progress: {}/{} ({:.2}%) | Unique addresses: {}",
                     processed_batches,
                     total_batches,
+                    percentage,
                     unique_set.len()
                 );
             }
@@ -1029,7 +1075,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ----------------------------------------------------
 
         if !unique_set.is_empty() {
-
             let file_name =
                 write_addresses_file(
                     &chain,
@@ -1039,7 +1084,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!();
             println!(
-                "PART {} COMPLETE",
+                "PART {:03} COMPLETE",
                 part_num
             );
 
@@ -1049,20 +1094,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             println!(
-                "File: {}",
+                "Output file: {}",
                 file_name
             );
         } else {
-
             println!(
-                "Part {} contains zero addresses.",
+                "PART {:03}: no addresses found.",
                 part_num
             );
         }
 
 
         // ----------------------------------------------------
-        // CHECKPOINT
+        // SAVE CHECKPOINT
         // ----------------------------------------------------
 
         let next_block =
@@ -1071,7 +1115,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         save_checkpoint(
             next_block
         )?;
-
 
         println!(
             "Checkpoint saved: {}",
@@ -1094,25 +1137,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
 
-    // --------------------------------------------------------
-    // CLEAN CHECKPOINT
-    // --------------------------------------------------------
+    // ========================================================
+    // REMOVE CHECKPOINT AFTER COMPLETE SUCCESS
+    // ========================================================
 
-    if Path::new(checkpoint_path()).exists() {
-
+    if Path::new(
+        checkpoint_file()
+    ).exists()
+    {
         fs::remove_file(
-            checkpoint_path()
+            checkpoint_file()
         )?;
     }
 
 
-    // --------------------------------------------------------
+    // ========================================================
     // FINAL SUMMARY
-    // --------------------------------------------------------
+    // ========================================================
 
     println!();
     println!("=======================================================");
-    println!("EXTRACTION COMPLETED");
+    println!("EXTRACTION COMPLETED SUCCESSFULLY");
     println!("=======================================================");
     println!("Chain       : {}", chain);
     println!("Start Block : {}", start_block);
